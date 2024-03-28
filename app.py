@@ -1,73 +1,129 @@
-import whisper
-import datetime
-import subprocess
-import speechbrain as sb
-import torch
-import pyannote.audio
-from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
-
-from pyannote.audio import Audio
-from pyannote.core import Segment
-
-import wave
-import contextlib
-
-from sklearn.cluster import AgglomerativeClustering
+from pydub import AudioSegment
+import noisereduce as nr
 import numpy as np
+from sklearn.cluster import AgglomerativeClustering
+from scipy.io import wavfile
+import os
+import torch
+import whisper
+from pyannote.audio import Pipeline, Inference
+from pyannote.core import Segment
+from typing import List, Tuple
+from pyannote.audio.pipelines.utils.hook import ProgressHook
 
-embedding_model = PretrainedSpeakerEmbedding("speechbrain/spkrec-ecapa-voxceleb", use_auth_token="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")
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
-path = "./audio/standardized.wav"
+def convert_and_preprocess(input_file_path, output_file_path='./audio/standardized.wav'):
+    # Convert audio file to wav format
+    audio = AudioSegment.from_file(input_file_path)
+    audio = audio.set_frame_rate(16000)  # Set the frame rate to 16 kHz
+    audio = audio.set_channels(1)  # Ensure audio is mono
 
-num_speakers = 2 #@param {type:"integer"}
+    # Normalize audio to a target amplitude
+    target_dBFS = -20.0
+    change_in_dBFS = target_dBFS - audio.dBFS
+    normalized_audio = audio.apply_gain(change_in_dBFS)
 
-language = 'English' #@param ['any', 'English']
+    # Export the normalized audio to a wav file
+    audio.export(output_file_path, format='wav')
+    
+    # Read the wav file data for noise reduction processing
+    sample_rate, data = wavfile.read(output_file_path)
+    data = data.astype(float)
 
-model_size = 'large' #@param ['tiny', 'base', 'small', 'medium', 'large']
+    # Apply noise reduction
+    reduced_noise_data = nr.reduce_noise(y=data, sr=sample_rate)
+    
+    # Convert the float audio data to int16, as wav files use 16-bit PCM
+    reduced_noise_data = reduced_noise_data.astype(np.int16)
+    
+    # Save the noise-reduced audio data back to a wav file
+    wavfile.write(output_file_path, sample_rate, reduced_noise_data)
 
-model = whisper.load_model(model_size)
+def diarize_speakers() -> List[Tuple[float, float, str]]:
+    # Load the speaker diarization pipeline (using a pre-trained model)
+    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token="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")
+    
+    with ProgressHook() as hook:
+      # Process the audio file
+      diarization = pipeline("./audio/standardized.wav", hook=hook)
+    
+    # Initialize a list to hold the output segments
+    segments = []
 
-result = model.transcribe("./audio/standardized.wav")
-segments = result["segments"]
+    # Iterate over the diarization result to prepare the output
+    for segment, _, speaker in diarization.itertracks(yield_label=True):
+        start_time = segment.start
+        end_time = segment.end
+        # Append the segment information to the segments list
+        segments.append((start_time, end_time, speaker))
+    
+    # Sort the segments list by start time
+    segments.sort(key=lambda x: x[0])
+    
+    return segments
 
-with contextlib.closing(wave.open(path,'r')) as f:
-  frames = f.getnframes()
-  rate = f.getframerate()
-  duration = frames / float(rate)
+def extract_speaker_embeddings(speaking_segments, model_inference, audio_path):
+    embeddings = []
+    
+    for segment in speaking_segments:
+        # Define the segment using pyannote.core.Segment
+        start_time, end_time, _ = segment
+        segment = Segment(start=start_time, end=end_time)
+        
+        # Extract the embedding for the defined segment
+        embedding = model_inference.crop(audio_path, segment)
+        embeddings.append(embedding)
+        
+    return embeddings
 
-audio = Audio()
+def perform_asr():
+  # Load the Whisper model
+  model = whisper.load_model("large")  # Choose between "tiny", "base", "small", "medium", "large" based on your needs and resources
 
-def segment_embedding(segment):
-  start = segment["start"]
-  # Whisper overshoots the end timestamp in the last segment
-  end = min(duration, segment["end"])
-  clip = Segment(start, end)
-  waveform, sample_rate = audio.crop(path, clip)
-  return embedding_model(waveform[None])
+  # Transcribe the audio file with timestamps
+  audio_file_path = "./audio/standardized.wav"  # Replace with the path to your actual file
+  result_segments = model.transcribe(audio_file_path)
+
+  # The result contains a 'segments' key with the transcription and timestamps for each segment
+  for segment in result_segments["segments"]:
+      print(f"{segment['start']}s - {segment['end']}s: {segment['text']}")
+
+  return result_segments
+
+# Replace 'input_file_path' with the path to your audio file
+convert_and_preprocess('./audio/input.mp3')
+
+speaking_segments = diarize_speakers()
+# Load the speaker embedding model
+embedding_model = Inference("pyannote/embedding", use_auth_token="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")
+
+# Assuming 'speaking_segments' contains the results from your diarization
+speaker_embeddings = extract_speaker_embeddings(speaking_segments, embedding_model, "./audio/standardized.wav")
+
+# Flatten the list of SlidingWindowFeature objects into a matrix for clustering
+embedding_matrix = np.vstack([embedding.data for embedding in speaker_embeddings])
+
+# Use agglomerative clustering to cluster the embeddings matrix
+# Since you know there are 2 speakers, you can use n_clusters=2
+cluster_model = AgglomerativeClustering(n_clusters=2)
+labels = cluster_model.fit_predict(embedding_matrix)
 
 
-embeddings = np.zeros(shape=(len(segments), 192))
-for i, segment in enumerate(segments):
-  embeddings[i] = segment_embedding(segment)
+# Use t-SNE to reduce the dimensionality of the embeddings to 2D for visualization
+tsne = TSNE(n_components=2, random_state=0)
+embeddings_2d = tsne.fit_transform(embedding_matrix)
 
-embeddings = np.nan_to_num(embeddings)
+# Plot the reduced embeddings with different colors for different clusters
+plt.figure(figsize=(8, 8))
+scatter = plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], c=labels, cmap='viridis')
+plt.title('2D Visualization of Speaker Embeddings')
+plt.legend(handles=scatter.legend_elements()[0], labels=set(labels))
+plt.grid(True)
+plt.show()
 
-clustering = AgglomerativeClustering(num_speakers).fit(embeddings)
-labels = clustering.labels_
-for i in range(len(segments)):
-  segments[i]["speaker"] = 'SPEAKER ' + str(labels[i] + 1)
+for segment in speaking_segments:
+    print(f"Speaker {segment[2]} from {segment[0]:.2f} to {segment[1]:.2f} seconds.")
 
-def time(secs):
-  return datetime.timedelta(seconds=round(secs))
-
-f = open("transcript.txt", "w")
-x = ""
-for (i, segment) in enumerate(segments):
-  if i == 0 or segments[i - 1]["speaker"] != segment["speaker"]:
-    f.write("\n" + segment["speaker"] + ' ' + str(time(segment["start"])) + '\n')
-  f.write(segment["text"][1:] + ' ')
-  x += "\n" + segment["speaker"] + ' ' + str(time(segment["start"])) + '\n'
-  x += segment["text"][1:] + ' '
-f.close()
-
-print(open('transcript.txt').read())
+# text_segments = perform_asr()
